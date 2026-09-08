@@ -72,8 +72,8 @@ function buildRedmineProvider(config, fetchImpl) {
     async fetchWithAuth(url) {
       return fetchImpl(url, { headers: { 'X-Redmine-API-Key': config.apiKey ?? '' } })
     },
-    async fetchPage(endpoint) {
-      const url = `${base}/${endpoint}&limit=100&offset=0&include=attachments`
+    async fetchPage(endpoint, offset = 0) {
+      const url = `${base}/${endpoint}&limit=100&offset=${offset}&include=attachments`
       const resp = await this.fetchWithAuth(url)
       if (!resp.ok) throw new Error(`Redmine API 返回 ${resp.status}`)
       return resp.json()
@@ -81,10 +81,17 @@ function buildRedmineProvider(config, fetchImpl) {
     async listAssigned() {
       const seen = new Map()
       for (const endpoint of this.buildQuerySet()) {
-        const list = await this.fetchPage(endpoint)
-        for (const issue of list.issues ?? []) {
-          const ext = String(issue.id)
-          if (!seen.has(ext)) seen.set(ext, mapRawIssue(issue, 'redmine', ext, base))
+        let offset = 0
+        while (true) {
+          const list = await this.fetchPage(endpoint, offset)
+          const issues = list.issues ?? []
+          for (const issue of issues) {
+            const ext = String(issue.id)
+            if (!seen.has(ext)) seen.set(ext, mapRawIssue(issue, 'redmine', ext, base))
+          }
+          offset += issues.length
+          const total = list.total_count ?? offset
+          if (issues.length === 0 || offset >= total) break
         }
       }
       const items = [...seen.values()]

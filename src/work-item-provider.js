@@ -26,8 +26,8 @@ export class RedmineProvider {
   async fetchWithAuth(url) {
     return this.fetch(url, { headers: { 'X-Redmine-API-Key': this.apiKey } })
   }
-  async fetchPage(endpoint) {
-    const url = `${this.baseUrl}/${endpoint}&limit=100&offset=0&include=attachments`
+  async fetchPage(endpoint, offset = 0) {
+    const url = `${this.baseUrl}/${endpoint}&limit=100&offset=${offset}&include=attachments`
     const resp = await this.fetchWithAuth(url)
     if (!resp.ok) throw new Error(`Redmine API 返回 ${resp.status}`)
     return resp.json()
@@ -35,10 +35,17 @@ export class RedmineProvider {
   async listAssigned() {
     const seen = new Map()
     for (const endpoint of this.buildQuerySet()) {
-      const list = await this.fetchPage(endpoint)
-      for (const issue of list.issues ?? []) {
-        const ext = String(issue.id)
-        if (!seen.has(ext)) seen.set(ext, mapRaw(issue, 'redmine', ext, this.baseUrl))
+      let offset = 0
+      while (true) {
+        const list = await this.fetchPage(endpoint, offset)
+        const issues = list.issues ?? []
+        for (const issue of issues) {
+          const ext = String(issue.id)
+          if (!seen.has(ext)) seen.set(ext, mapRaw(issue, 'redmine', ext, this.baseUrl))
+        }
+        offset += issues.length
+        const total = list.total_count ?? offset
+        if (issues.length === 0 || offset >= total) break
       }
     }
     const items = [...seen.values()]

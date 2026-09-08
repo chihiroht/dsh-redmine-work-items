@@ -49,3 +49,21 @@ test('getDetail 返回单条工单摘要字段', async () => {
   assert.equal(it.external_id, '9')
   assert.equal(it.category, '缺陷')
 })
+
+test('listAssigned 循环翻页直到 total（去重聚合）', async () => {
+  const empty = { ok: true, json: { issues: [], total_count: 0 } }
+  const pg1 = { ok: true, json: { issues: [
+    { id: 1, subject: 'a', tracker: { name: '缺陷' } },
+    { id: 2, subject: 'b', tracker: { name: '缺陷' } },
+  ], total_count: 4 } }
+  const pg2 = { ok: true, json: { issues: [
+    { id: 3, subject: 'c', tracker: { name: '缺陷' } },
+    { id: 4, subject: 'd', tracker: { name: '缺陷' } },
+  ], total_count: 4 } }
+  const fetchImpl = makeFetch([pg1, pg2, empty, empty, empty, empty])
+  const p = new RedmineProvider({ baseUrl: 'http://x', apiKey: 'KEY' }, fetchImpl)
+  const { items } = await p.listAssigned()
+  assert.equal(fetchImpl.calls.length, 6) // 第1个 endpoint 翻2页 + 其余4个 endpoint 各1页
+  assert.equal(items.length, 4)
+  assert.ok(items.some((i) => i.external_id === '3'))
+})
