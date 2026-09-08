@@ -10,11 +10,12 @@
 | 文件 | 责任 |
 |---|---|
 | `src/work-item-core.js` | 纯逻辑真源：字段映射 / buildContext / 过滤（`node:test` 单测对象）。 |
-| `src/work-item-provider.js` | WorkItemProvider 抽象 + RedmineProvider（listAssigned/getDetail/downloadAttachment/testAuth）。 |
-| `src/work-item-plugin.host.js` | `code.host` 函数体（内联逻辑 + harness Tool/handle 注册）。 |
-| `src/work-item-plugin.client.js` | `code.client` 函数体（工作台 UI，`React.createElement`）。 |
-| `test/*.test.mjs` | `node:test` 单测（core/provider 纯逻辑）。 |
+| `src/work-item-provider.js` | WorkItemProvider 抽象 + RedmineProvider（fetch-Response 传输，供单测/自检脚本）。 |
+| `src/work-item-plugin.host.js` | `code.host` 函数体（**已按 cordis 源码校准**：`ctx.web` GET+`?key=` 认证、`ctx.fs`、`defineTool`/`registerTool`/`handle`）。 |
+| `src/work-item-plugin.client.js` | `code.client` 函数体（工作台 UI，`React.createElement`，`tool.view.cordis` 槽）。 |
+| `test/*.test.mjs` | `node:test` 单测（core/provider 纯逻辑 + plugin 语法门 + plugin wire 冒烟）。 |
 | `scripts/verify-provider.mjs` | 真实 Redmine 接入自检（L1，无需 cordis）。 |
+| `docs/calibration-notes.md` | 校准笔记：已确认的 cordis API 事实 + 仍待 L2 确认的点 + 沙箱硬限制。 |
 
 ## 执行前提
 
@@ -32,7 +33,9 @@ Builtin.listBuiltins  /  Tool.listTools      # 确认 harness 注册动态 Tool 
 Service.listService                          # 确认 Host 的 fs / 网络（fetch）/ workDir 能力
 ```
 
-按结果微调 `code.host` / `code.client` 中所有 `TODO(cordis_inspect)` 标注处。
+按结果核对 `docs/calibration-notes.md`「仍待 L2 确认」清单（接线主体已按源码校准，这里主要确认
+`ctx.fs.writeBytes` 是否存在、`ctx.web` 对 Redmine 的 `body.content` 是否 `text`、`dsh-client-ui-cordis`
+是否渲染 `tool.view.cordis`）。
 
 ## 2. 创建并运行插件
 
@@ -92,9 +95,19 @@ REDMINE_API_KEY=xxx REDMINE_SESSION_COOKIE=xxx node scripts/verify-provider.mjs
 
 **OK 判据：** 模型能读取工单内容并据此继续工作（即"注入对话"达成）。
 
-> 若 L2/L3 失败，多为 `code.host`/`code.client` 的 `TODO(cordis_inspect)` 运行时接线未按实际接口校准，把 `cordis_inspect_self` 诊断贴回来即可修。
+> 若 L2/L3 失败，先看 `docs/calibration-notes.md`（已按 cordis 源码校准的接线事实 + 剩余待确认项），
+> 再把 `cordis_inspect_self` 诊断贴回来即可修。
 
-## 已知边界与待校准
+## 已知边界与限制（校准后）
 
-- 运行时接线（slot 落点、`harness.registerTool` 签名、`globalThis.fetch`、`fs`、视觉模型调用、图片访问）均为**初稿 + 待 `cordis_inspect` 校准**，见各文件 `TODO(cordis_inspect)`。
-- 附件图片默认**不自动下载**；识图在同步到图片附件时触发，`description_status` 防重复识图。
+- **接线已校准**：`code.host`/`code.client` 已按 `dsh-cordis-host-runner` / `dsh-cordis-client-runner` 源码
+  修正（`ctx.web.fetch` 只能 GET + 无 header → Redmine 用 `?key=` 认证；`ctx.fs` 读写文件；`defineTool`/`registerTool`/
+  `handle`；client 用 `tool.view.cordis` 槽）。详见 `docs/calibration-notes.md`。
+- **仍待 L2 确认**（cordis 规范禁止凭空推断）：`ctx.fs.writeBytes` 是否存在、`ctx.web` 对 Redmine 的 `body.content`
+  是否 `text`、`dsh-client-ui-cordis` 是否渲染 `tool.view.cordis`。
+- **视觉识图（沙箱硬限制）**：`ctx.web` 仅支持 GET 且无 header，无法 POST OpenAI 兼容视觉接口 → 本版记
+  `description_status='skipped'` + `lastDescribeError` 说明；如需识图须在 L2 接入 `ctx.shell`/`curl` 或 web-POST。
+- **附件二进制下载**：`ctx.web` 的 body 仅 text/html 且不能带 Cookie header → 二进制作可能损坏或 404；本版 best-effort，
+  失败记 `skipped`，不阻塞核心。
+- **无持久化边界**：工单缓存、凭证、识图模型配置在**进程内存**；附件图片落在插件 `__state` 的 fs 相对路径 `.monai-work-items/`
+  （会话 cwd 下，系统会清理）。重启后需重新同步、重填凭证。

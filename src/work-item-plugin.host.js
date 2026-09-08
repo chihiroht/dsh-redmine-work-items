@@ -1,21 +1,32 @@
 // src/work-item-plugin.host.js
-// 作为 code.host 传给 cordis_define 的 plain JS 函数体。
+// 作为 code.host 传给 cordis_define 的 plain JS 函数体（无 import / require / TS / JSX）。
 //
-// ⚠️ cordis 约束：不能 import / require / TS / JSX。因此本函数体内联了
-//    src/work-item-core.js 与 src/work-item-provider.js 的同段逻辑（单一真源是那两个文件，
-//    此处为自包含副本，改动时须同步）。
+// ⚠️ 已按 @deepseek-ai/dsh-cordis-host-runner / dsh-cordis-client-runner 源码校准。cordis 沙箱事实：
+//   1. host 半在 node:vm 沙箱求值：无 require / import / fetch / Buffer。
+//      网络走 ctx.web、文件走 ctx.fs、进程走 ctx.bash；base64 用全局 btoa/atob/TextEncoder。
+//   2. ctx.web.fetch({ url }, signal)：仅支持 GET、不能带 header，返回
+//      { url, statusCode, body:{ kind:'html'|'text', content }, truncated }。
+//      → Redmine 认证用 `?key=` 查询参数；JSON 用 JSON.parse(body.content)。
+//   3. harness.defineTool({ name, description, parameters, output:{ schema, render }, execute })
+//      产出工具，harness.registerTool(ctx, tool)（或 ctx.tools.register）注册；
+//      output.render 必须返回 [{ type:'text', text: String(value) }]。
+//   4. harness.handle(method, (args) => value) 注册 Client→Host RPC，结果经 JSON 往返。
+//   5. 服务需在 plugins 的 inject 声明（['tools','fs','web']），apply 里用 ctx.web / ctx.fs；
+//      ctx.tools 恒可用。
 //
-// ⚠️ 运行时接线为「初稿 + 待校准」：下列标注 `TODO(cordis_inspect)` 的接口需在具备
-//    cordis_* 工具的 DSH 会话用 cordis_inspect_list / Slots.listSubTree /
-//    Builtin.listBuiltins / Tool.listTools / Service.listService 确认后再微调。
-//    涉及：workDir 来源、ctx.get('harness'|'fs') 名称与签名、globalThis.fetch 可用性、
-//    harness.registerTool 确切 API、视觉模型调用路径、图片访问方式。
+// 沙箱限制（本版如实处理，不阻塞核心功能）：
+//   - 视觉识图需要 POST + Authorization header，ctx.web 仅支持 GET → describeImage 记录
+//     description_status='skipped' 并在 lastDescribeError 说明原因（若 DSH 后续提供 web-POST
+//     或 bash/curl 通道，可在此接入）。
+//   - 附件二进制下载：ctx.web 的 WebFetchBody 仅 text/html 且不能带 Cookie header，
+//     二进制可能被解码损坏 → 保留元数据 + best-effort，失败不报错。
 //
-// 若 cordis_define 需要完整 function 源码，用 `function codeHost() { <以下函数体> }` 包裹；
-// 若需要函数体，直接使用本文件内容。
+// 纯逻辑（mapRawIssue / buildContext / filterItems / 分页）与 src/work-item-core.js、
+// src/work-item-provider.js 保持同段；但传输层在此适配 ctx.web（provider.js 是 fetch-Response
+// 传输，仅用于纯逻辑单测与 verify-provider.mjs）。改动时须同步这三处。
 
-// ---- 内联逻辑（来自 src/work-item-core.js）----
 const BUG_CATEGORIES = new Set(['bug', 'defect', '缺陷'])
+
 function mapRawIssue(issue, provider, externalId, baseUrl) {
   const watcher = issue.custom_fields?.find((cf) => cf.id === 41)?.value?.user?.firstname
   return {
@@ -32,6 +43,7 @@ function mapRawIssue(issue, provider, externalId, baseUrl) {
     web_url: `${baseUrl}/issues/${issue.id}`, updated_at: issue.updated_on ?? null,
   }
 }
+
 function buildContext(wi) {
   const parts = [`工单 #${wi.external_id}: ${wi.title} [${wi.status ?? '未知'}]`]
   if (wi.category) parts.push(`分类: ${wi.category}`)
@@ -39,223 +51,250 @@ function buildContext(wi) {
   if (wi.version) parts.push(`版本: ${wi.version}`)
   if (wi.assignee) parts.push(`指派: ${wi.assignee}`)
   if (wi.description) parts.push(`\n描述:\n${String(wi.description).slice(0, 2000)}`)
-  const imgDescs = (wi.attachments ?? []).filter((a) => a.ai_description)
+  const imgDescs = (wi.attachments ?? [])
+    .filter((a) => a.ai_description)
     .map((a) => `### ${a.name}\n${a.ai_description}`)
   if (imgDescs.length) parts.push(`\n## 附件图片描述\n\n${imgDescs.join('\n\n')}`)
   return parts.join('\n')
 }
+
 function filterItems(items, query) {
   const { search, tracker_kind } = query ?? {}
   let out = items
-  if (search) out = out.filter((it) => (it.title ?? '').includes(search) || (it.description ?? '').includes(search))
+  if (search) out = out.filter((it) =>
+    (it.title ?? '').includes(search) || (it.description ?? '').includes(search))
   if (tracker_kind === 'bug') out = out.filter((it) => BUG_CATEGORIES.has(String(it.category ?? '').toLowerCase()))
   if (tracker_kind === 'other') out = out.filter((it) => !BUG_CATEGORIES.has(String(it.category ?? '').toLowerCase()))
   return [...out].sort((a, b) => String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')))
 }
 
-// ---- 内联逻辑（来自 src/work-item-provider.js 的 RedmineProvider）----
+// ---- 与 provider.js 同段的查询集 ----
 const DEFAULT_BASE = 'http://qn.pm.netease.com:8120'
 const QUERIES = [
-  'assigned_to_id=me&status_id=open', 'author_id=me&status_id=1', 'author_id=me&status_id=2',
+  'assigned_to_id=me&status_id=open',
+  'author_id=me&status_id=1',
+  'author_id=me&status_id=2',
 ]
 const PROJECT_QUERIES = [
   'projects/redmine-system-builder/issues.json?cf_41=me&status_id=1',
   'projects/redmine-system-builder/issues.json?cf_41=me&status_id=2',
 ]
-function buildRedmineProvider(config, fetchImpl) {
-  const base = (config.baseUrl || DEFAULT_BASE).replace(/\/$/, '')
-  return {
-    id: 'redmine',
-    buildQuerySet() {
-      return [...QUERIES.map((q) => `issues.json?${q}`), ...PROJECT_QUERIES]
-    },
-    async fetchWithAuth(url) {
-      return fetchImpl(url, { headers: { 'X-Redmine-API-Key': config.apiKey ?? '' } })
-    },
-    async fetchPage(endpoint, offset = 0) {
-      const url = `${base}/${endpoint}&limit=100&offset=${offset}&include=attachments`
-      const resp = await this.fetchWithAuth(url)
-      if (!resp.ok) throw new Error(`Redmine API 返回 ${resp.status}`)
-      return resp.json()
-    },
-    async listAssigned() {
-      const seen = new Map()
-      for (const endpoint of this.buildQuerySet()) {
-        let offset = 0
-        while (true) {
-          const list = await this.fetchPage(endpoint, offset)
-          const issues = list.issues ?? []
-          for (const issue of issues) {
-            const ext = String(issue.id)
-            if (!seen.has(ext)) seen.set(ext, mapRawIssue(issue, 'redmine', ext, base))
-          }
-          offset += issues.length
-          const total = list.total_count ?? offset
-          if (issues.length === 0 || offset >= total) break
-        }
-      }
-      const items = [...seen.values()]
-      return { items, providerUserId: items.find((i) => i.assignee || i.author)?.assignee ?? null }
-    },
-    async getDetail(externalId) {
-      const url = `${base}/issues/${externalId}.json?include=attachments,description`
-      const resp = await this.fetchWithAuth(url)
-      if (!resp.ok) throw new Error(`Redmine API 返回 ${resp.status}`)
-      const { issue } = await resp.json()
-      return mapRawIssue(issue, 'redmine', String(issue.id), base)
-    },
-    async downloadAttachment(att) {
-      if (!att.url) return null
-      try {
-        const headers = (config.sessionCookie ?? '') ? { Cookie: config.sessionCookie } : {}
-        const resp = await fetchImpl(att.url, { headers })
-        if (!resp.ok) return null
-        const bytes = new Uint8Array(await resp.arrayBuffer())
-        if (bytes.length < 64) return null
-        const safe = att.name.replace(/[/\\\0]/g, '')
-        return { bytes, filename: safe }
-      } catch { return null }
-    },
-    async testAuth() {
-      try {
-        const resp = await this.fetchWithAuth(`${base}/users/current.json`)
-        return resp.ok ? { ok: true, message: 'ok' } : { ok: false, message: `Redmine API 返回 ${resp.status}` }
-      } catch (e) { return { ok: false, message: String(e?.message ?? e) } }
-    },
-  }
-}
-
-// ---- 状态（进程内存）----
-const state = {
-  map: new Map(),
-  config: {
-    provider: 'redmine',
-    redmine: { baseUrl: DEFAULT_BASE, apiKey: '', sessionCookie: '' },
-    vision: { endpoint: '', model: '', apiKey: '' },
-  },
-  lastSyncAt: null, redmineUserId: null, configError: null,
-}
-let workItemDir = ''
-
-// ---- 同步 / 附件 / 识图（fsApi 由 apply 传入，来源需 cordis_inspect 确认）----
-async function syncWorkItems(fetchImpl, fsApi) {
-  const cfg = state.config
-  if (!cfg.redmine.apiKey) {
-    state.configError = '请先配置 Redmine API Key'
-    return { synced: 0, failed: 0, removed: 0, errors: [state.configError] }
-  }
-  const provider = buildRedmineProvider(cfg.redmine, fetchImpl)
-  const { items } = await provider.listAssigned()
-  for (const it of items) state.map.set(it.external_id, it)
-  for (const it of items) await ensureAttachments(it, provider, fsApi)
-  let removed = 0
-  for (const ext of [...state.map.keys()]) {
-    if (!items.some((i) => i.external_id === ext)) { state.map.delete(ext); removed++ }
-  }
-  state.lastSyncAt = Date.now()
-  return { synced: items.length, failed: 0, removed, errors: [] }
-}
-
-async function ensureAttachments(item, provider, fsApi) {
-  const dir = `${workItemDir}/${item.external_id}`
-  await fsApi.mkdir(dir, { recursive: true })
-  for (const att of item.attachments ?? []) {
-    if (!att.local_path && att.url) {
-      const dl = await provider.downloadAttachment(att)
-      if (dl) {
-        att.local_path = `${dir}/${dl.filename}`
-        await fsApi.writeFile(att.local_path, dl.bytes)
-      } else { att.description_status = 'error' }
-    }
-    if (att.local_path && att.description_status === 'none') {
-      att.description_status = 'processing'
-      try {
-        att.ai_description = await describeImage(att.local_path, fsApi)
-        att.description_status = 'done'
-      } catch (e) {
-        att.description_status = 'error'
-        state.lastDescribeError = String(e?.message ?? e)
-      }
-    }
-  }
-}
-
-async function describeImage(path, fsApi) {
-  const v = state.config.vision
-  if (!v.model || !v.apiKey) throw new Error('未配置视觉模型 endpoint/model/apiKey')
-  const b64 = await readImageAsBase64(path, fsApi)
-  // TODO(cordis_inspect): 视觉模型调用路径——DSH Host 是否有内部 LLM Service 可调，
-  //   还是按用户配置的 endpoint/model/apiKey（OpenAI 兼容）。此处给出 OpenAI 兼容示例。
-  const resp = await globalThis.fetch(v.endpoint || 'https://api.deepseek.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${v.apiKey}` },
-    body: JSON.stringify({
-      model: v.model,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'text', text: '描述这张工单截图的内容与关键需求点，中文，≤200字' },
-          { type: 'image_url', image_url: { url: `data:image/png;base64,${b64}` } },
-        ],
-      }],
-    }),
-  })
-  const data = await resp.json()
-  return data?.choices?.[0]?.message?.content ?? '（未返回描述）'
-}
-
-async function readImageAsDataUrl(id, name, fsApi) {
-  const buf = await fsApi.readFile(`${workItemDir}/${id}/${name}`)
-  return `data:image/png;base64,${b64frombytes(buf)}`
-}
-async function readImageAsBase64(path, fsApi) {
-  return b64frombytes(await fsApi.readFile(path))
-}
+const QUERY_SET = [...QUERIES.map((q) => `issues.json?${q}`), ...PROJECT_QUERIES]
 
 return {
-  inject: [], // 仅对硬依赖 Service 声明；其余用 ctx.get 判空
-  apply(ctx) {
-    // TODO(cordis_inspect): 临时目录来源（如 ctx.get('workdir') / 某 service），
-    //   Session/Scoped 目录。这里先用进程临时目录兜底并标注。
-    workItemDir = (ctx.get('workDir') || ctx.get('tmpdir')) ?? '.monai-work-items'
-    const harness = ctx.get('harness') // TODO(cordis_inspect): harness 名称/API 以 Builtin.listBuiltins 为准
-    if (harness === undefined) return
-    const fsApi = { // TODO(cordis_inspect): 用 Service.listService 查真实 fs 能力；若 DSH Host 暴露 Node fs 则用之
-      mkdir: (p, o) => globalThis.__dsh_fs?.mkdir?.(p, o) ?? Promise.resolve(),
-      writeFile: (p, b) => globalThis.__dsh_fs?.writeFile?.(p, b) ?? Promise.resolve(),
-      readFile: (p) => (globalThis.__dsh_fs?.readFile ? globalThis.__dsh_fs.readFile(p) : Promise.reject(new Error('fs 未确认'))),
+  name: 'monai-work-items',
+  inject: ['tools', 'fs', 'web'],
+  apply(ctx, config) {
+    const state = {
+      map: new Map(),
+      config: Object.assign({
+        provider: 'redmine',
+        redmine: { baseUrl: DEFAULT_BASE, apiKey: '', sessionCookie: '' },
+        vision: { endpoint: '', model: '', apiKey: '' },
+      }, config ?? {}),
+      lastSyncAt: null,
+      lastDescribeError: null,
     }
-    const fetchImpl = globalThis.fetch // TODO(cordis_inspect): 若 Host 无全局 fetch，改用 Service.listService 中的网络能力
 
-    // 动态 Tool（模型按需）：签名/schema 以 Tool.listTools 为准
-    const toolSchema = { type: 'object', properties: { search: { type: 'string' }, tracker_kind: { type: 'string' } } }
-    harness.registerTool('list_work_items', toolSchema, async (args = {}) => {
-      const items = filterItems([...state.map.values()], args)
-      return JSON.stringify(items.map((i) => `${i.external_id}: ${i.title} [${i.status}]`))
+    function cfg() {
+      const red = state.config.redmine || {}
+      return { baseUrl: (red.baseUrl || DEFAULT_BASE).replace(/\/$/, ''), apiKey: red.apiKey || '' }
+    }
+
+    // ---- ctx.web 适配（GET + ?key 认证 + JSON.parse）----
+    function withKey(url) {
+      const key = cfg().apiKey
+      return `${url}${url.includes('?') ? '&' : '?'}key=${encodeURIComponent(key)}`
+    }
+    async function webGetJson(url, signal) {
+      const res = await ctx.web.fetch({ url }, signal)
+      if (res.statusCode >= 400) throw new Error(`Redmine API 返回 ${res.statusCode}`)
+      return JSON.parse(res.body.content)
+    }
+    function pageUrl(endpoint, offset) {
+      const c = cfg()
+      const joined = `${endpoint}${endpoint.includes('?') ? '&' : '?'}limit=100&offset=${offset}&include=attachments`
+      return withKey(`${c.baseUrl}/${joined}`)
+    }
+
+    // ---- provider（ctx.web 传输版）----
+    function makeProvider(signal) {
+      return {
+        id: 'redmine',
+        buildQuerySet: () => QUERY_SET,
+        async fetchPage(endpoint, offset) {
+          const data = await webGetJson(pageUrl(endpoint, offset), signal)
+          return { issues: data.issues ?? [], total_count: data.total_count ?? 0 }
+        },
+        async listAssigned() {
+          const seen = new Map()
+          for (const endpoint of this.buildQuerySet()) {
+            let offset = 0
+            while (true) {
+              const list = await this.fetchPage(endpoint, offset)
+              for (const issue of list.issues) {
+                const ext = String(issue.id)
+                if (!seen.has(ext)) seen.set(ext, mapRawIssue(issue, 'redmine', ext, cfg().baseUrl))
+              }
+              offset += list.issues.length
+              if (list.issues.length === 0 || offset >= list.total_count) break
+            }
+          }
+          const items = [...seen.values()]
+          return { items, providerUserId: items.find((i) => i.assignee || i.author)?.assignee ?? null }
+        },
+        async getDetail(externalId) {
+          const c = cfg()
+          const data = await webGetJson(withKey(`${c.baseUrl}/issues/${externalId}.json?include=attachments,description`), signal)
+          return mapRawIssue(data.issue, 'redmine', String(data.issue.id), c.baseUrl)
+        },
+        async downloadAttachment(att) {
+          // 注：ctx.web 无 header 且仅 text/html body；二进制可能损坏 → best-effort。
+          if (!att.url) return null
+          try {
+            const res = await ctx.web.fetch({ url: withKey(att.url) }, signal)
+            if (res.statusCode >= 400) return null
+            const text = res.body.content
+            if (!text || text.length < 64) return null
+            return { bytes: textToBytes(text), filename: safeName(att.name) }
+          } catch { return null }
+        },
+        async testAuth() {
+          try { await webGetJson(withKey(`${cfg().baseUrl}/users/current.json`), signal); return { ok: true, message: 'ok' } }
+          catch (e) { return { ok: false, message: String(e?.message ?? e) } }
+        },
+      }
+    }
+
+    // ---- 同步 + 附件 + 识图（识图在沙箱内无法 POST，如实跳过）----
+    async function syncWorkItems(signal) {
+      if (!cfg().apiKey) return { synced: 0, failed: 0, removed: 0, errors: ['请先配置 Redmine API Key'] }
+      const provider = makeProvider(signal)
+      const { items } = await provider.listAssigned()
+      for (const it of items) {
+        state.map.set(it.external_id, it)
+        await runAttachmentStep(it, provider, signal)
+      }
+      let removed = 0
+      for (const ext of [...state.map.keys()]) {
+        if (!items.some((i) => i.external_id === ext)) { state.map.delete(ext); removed++ }
+      }
+      state.lastSyncAt = Date.now()
+      return { synced: items.length, failed: 0, removed, errors: [] }
+    }
+
+    async function runAttachmentStep(item, provider, signal) {
+      for (const att of item.attachments ?? []) {
+        if (!att.local_path && att.url) {
+          const dl = await provider.downloadAttachment(att)
+          if (dl) {
+            try {
+              await writeBytes(item.external_id, dl.filename, dl.bytes, signal)
+              att.local_path = `${item.external_id}/${dl.filename}`
+            } catch { att.description_status = 'error' }
+          } else {
+            att.description_status = 'skipped' // 下载失败/受限
+          }
+        }
+        if (att.local_path && att.description_status === 'none') {
+          const ok = await describeImage(att.local_path, signal)
+          att.description_status = ok ? 'done' : 'skipped'
+        }
+      }
+    }
+
+    async function writeBytes(ext, name, bytes, signal) {
+      const target = await ctx.fs.resolve(`.monai-work-items/${ext}/${name}`, { signal })
+      if (typeof ctx.fs.writeBytes === 'function') await ctx.fs.writeBytes(target, bytes, undefined, signal)
+      else await ctx.fs.writeText(target, textFromBytes(bytes), undefined, signal)
+    }
+
+    async function describeImage(path, signal) {
+      const v = state.config.vision || {}
+      if (!v.model || !v.apiKey) return null
+      // ctx.web 仅支持 GET + 无 header，无法 POST OpenAI 兼容视觉接口。
+      state.lastDescribeError = '视觉识图需 POST + Authorization（ctx.web 仅支持 GET 且无 header）；本版跳过识图。'
+      return null
+    }
+
+    async function readImageAsDataUrl(ext, name, signal) {
+      const target = await ctx.fs.resolve(`.monai-work-items/${ext}/${name}`, { signal })
+      const bytes = await ctx.fs.readBytes(target, signal)
+      return `data:image/png;base64,${btoa(binaryString(bytes))}`
+    }
+
+    // ---- 动态 Tool ----
+    function makeTool(spec) {
+      const tool = harness.defineTool(spec)
+      harness.registerTool(ctx, tool)
+    }
+    makeTool({
+      name: 'list_work_items',
+      description: '列出已同步的「指派给我的工单」。参数 tracker_kind=bug|other 可过滤 Bug/其它。',
+      parameters: {
+        search: { type: 'string', description: '按标题/描述子串过滤' },
+        tracker_kind: { type: 'string', description: 'bug 或 other，可选' },
+      },
+      output: { schema: { type: 'string' }, render: (args, value) => [{ type: 'text', text: String(value) }] },
+      async execute(args) {
+        const items = filterItems([...state.map.values()], args)
+        return items.length ? items.map((i) => `${i.external_id}: ${i.title} [${i.status}]`).join('\n')
+          : '（暂无工单，先调用 sync_work_items 同步）'
+      },
     })
-    harness.registerTool('get_work_item_detail', { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] }, async (args) => {
-      const it = state.map.get(String(args?.id))
-      return it ? buildContext(it) : `未找到工单 #${args?.id}`
+    makeTool({
+      name: 'get_work_item_detail',
+      description: '取单个工单详情（含描述与附件/识图描述）。',
+      parameters: { id: { type: 'string', required: true, description: '工单 external_id' } },
+      output: { schema: { type: 'string' }, render: (args, value) => [{ type: 'text', text: String(value) }] },
+      async execute(args) {
+        const it = state.map.get(String(args?.id))
+        return it ? buildContext(it) : `未找到工单 #${args?.id}`
+      },
     })
-    harness.registerTool('sync_work_items', { type: 'object', properties: {} }, async () => {
-      const r = await syncWorkItems(fetchImpl, fsApi)
-      return `同步完成：拉取 ${r.synced}，失败 ${r.failed}，清理 ${r.removed}`
+    makeTool({
+      name: 'sync_work_items',
+      description: '从 Redmine 同步「指派给我的工单」到内存，并尝试附件/识图。',
+      parameters: {},
+      output: { schema: { type: 'string' }, render: (args, value) => [{ type: 'text', text: String(value) }] },
+      async execute() {
+        const r = await syncWorkItems()
+        const base = `同步完成：拉取 ${r.synced}，失败 ${r.failed}，清理 ${r.removed}`
+        return r.errors && r.errors.length ? `${base}（${r.errors[0]}）` : base
+      },
     })
 
-    // handle（Client 读）
-    harness.handle('wi:list', async (q) => filterItems([...state.map.values()], q))
+    // ---- Client→Host RPC ----
+    harness.handle('wi:list', async (args) => filterItems([...state.map.values()], args ?? {}))
     harness.handle('wi:get', async (id) => state.map.get(String(id)) ?? null)
-    harness.handle('wi:sync', async () => syncWorkItems(fetchImpl, fsApi))
-    harness.handle('wi:image', async (id, name) => {
-      try { return await readImageAsDataUrl(id, name, fsApi) } catch { return null }
+    harness.handle('wi:sync', async () => syncWorkItems())
+    harness.handle('wi:image', async (ext, name) => {
+      try { return await readImageAsDataUrl(ext, name) } catch { return null }
+    })
+    harness.handle('wi:config', async (patch) => {
+      if (patch && typeof patch === 'object') {
+        if (patch.redmine) Object.assign(state.config.redmine, patch.redmine)
+        if (patch.vision) Object.assign(state.config.vision, patch.vision)
+      }
+      return {
+        redmine: { ...state.config.redmine, apiKey: maskKey(state.config.redmine.apiKey) },
+        vision: { ...state.config.vision, apiKey: maskKey(state.config.vision.apiKey) },
+      }
     })
   },
 }
 
-function b64frombytes(bytes) {
-  // 浏览器/宿主环境可能无 Buffer，用 btoa 兜底；Node 用 Buffer。
-  if (typeof Buffer !== 'undefined') return Buffer.from(bytes).toString('base64')
+// ---- 工具/helper（宿主层）----
+function maskKey(k) { return k ? `${String(k).slice(0, 5)}…` : '' }
+function safeName(n) { return String(n).replace(/[/\\\0]/g, '') }
+function binaryString(bytes) {
   let s = ''
   for (const b of bytes) s += String.fromCharCode(b)
-  return btoa(s)
+  return s
 }
+function textToBytes(text) {
+  const arr = new Uint8Array(text.length)
+  for (let i = 0; i < text.length; i++) arr[i] = text.charCodeAt(i) & 0xff
+  return arr
+}
+function textFromBytes(bytes) { return binaryString(bytes) }
