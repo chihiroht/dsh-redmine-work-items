@@ -32,7 +32,7 @@ dsh plugin --profile web add ./dsh-redmine-work-items-0.1.0.tgz
 进入 DSH「设置 → 工单管理」：
 
 - **API 访问键**（必填）：在 Redmine「我的账户」页获取。
-- **Redmine baseUrl**（默认 `http://qn.pm.netease.com:8120`）。
+- **Redmine baseUrl**（必填）：填你自己的 Redmine 地址（如 `https://your-redmine.example.com`）。
 - **自动同步**：开关 + 间隔（最小 5 分钟）。
 
 > 说明：新版本已移除 Session Cookie 字段——Redmine 走 API 访问键即可；网易 SSO 的 session cookie 在 Node host 端无法自动获取，故不再保留。
