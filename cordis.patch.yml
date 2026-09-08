@@ -1,0 +1,5 @@
+# dsh-redmine-work-items bundle patch: inserts the work-items plugin row into the profile tree.
+# name uses the package name so Node module resolution finds the installed/built code.
+- insert:
+    - id: issue-tracker
+      name: '@chihiroht/dsh-redmine-work-items'
